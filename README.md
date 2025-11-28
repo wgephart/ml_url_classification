@@ -4,14 +4,12 @@
 
 Leave-One-User-Out CV too long for our dataset size of ~650,000 rows (found through trying it on a traditional logistic regression model). I ran it for 4 hours but to no avail.
 
-## Current features: 17 so far
-url
+## Current features: 15 so far
 url_length
 num_digits
 num_periods
 num_slashes
 num_ats
-domain
 min_brand_dist
 is_typosquat
 has_html
@@ -24,6 +22,12 @@ has_brand_kw
 has_non_ascii_chars
 digit_len_ratio
 
-## Targets: 2
+## Dropped features: 5
+url
+malicious
 type
+domain
+users - shouldn't this be url instead of users? we don't have users
+
+## Target: 1
 malicious
