@@ -4,6 +4,29 @@ import numpy as np
 import pickle
 import joblib
 import tensorflow as tf
+import tldextract
+import Levenshtein
+import re
+import math
+from collections import Counter
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+# --- 1. SETUP & CONFIGURATION ---
+st.set_page_config(page_title="Malicious URL Detector", page_icon="🛡️")
+st.header("Malicious URL Detector")
+
+# Allowlist for major sites (Bypasses AI to prevent false positives)
+SAFE_DOMAINS = [
+    'google.com', 'www.google.com', 'youtube.com', 'facebook.com', 
+    'amazon.com', 'wikipedia.org', 'instagram.com', 'twitter.com', 
+    'linkedin.com', 'netflix.com', 'microsoft.com', 'apple.com',
+    'github.com', 'nytimes.com', 'cnn.com'
+]
+
+BRANDS = ['google', 'paypal', 'microsoft', 'apple', 'amazon', 'netflix', 'facebook', 'bank', 'adobe']
+SUSPICIOUS_WORDS = ['login', 'signin', 'verify', 'update', 'account', 'secure', 'banking', 'confirm']
+
+# --- CRITICAL: DISABLE MAC GPU ---
 try:
     tf.config.set_visible_devices([], 'GPU')
     visible_devices = tf.config.get_visible_devices()
@@ -11,44 +34,27 @@ try:
         assert device.device_type != 'GPU'
 except:
     pass
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-import tldextract
-import Levenshtein
-import re
-import math
-from collections import Counter
-
-# --- 1. SETUP & CONFIGURATION ---
-st.set_page_config(page_title="Malicious URL Detector", page_icon="🛡️")
-
-BRANDS = ['google', 'paypal', 'microsoft', 'apple', 'amazon', 'netflix', 'facebook', 'bank', 'adobe']
-SUSPICIOUS_WORDS = ['login', 'signin', 'verify', 'update', 'account', 'secure', 'banking', 'confirm']
 
 # --- 2. LOAD ARTIFACTS ---
 @st.cache_resource
 def load_models():
-    # 1. Load Tokenizer (Saved with Pickle)
     with open('tokenizer.pkl', 'rb') as f:
         tokenizer = pickle.load(f)
-        
-    # 2. Load Scaler & Encoder (Saved with Joblib)
-    scaler = joblib.load('scaler.pkl')        # <--- CHANGED to joblib
-    encoder = joblib.load('label_encoder.pkl') # <--- CHANGED to joblib
     
-    # 3. Load XGBoost (Saved with Joblib)
-    xgb_model = joblib.load('xgb_model.pkl') # <--- CHANGED to joblib
-    
-    # 4. Load Neural Network (Saved with Keras)
+    scaler = joblib.load('scaler.pkl')
+    encoder = joblib.load('label_encoder.pkl')
+    #xgb_model = joblib.load('xgb_gatekeeper.pkl') # Make sure this name matches your file!
     nn_model = tf.keras.models.load_model('hybrid_model.h5')
     
-    return tokenizer, scaler, encoder, xgb_model, nn_model
+    return tokenizer, scaler, encoder, nn_model
 
 try:
-    tokenizer, scaler, encoder, xgb_model, nn_model = load_models()
+    tokenizer, scaler, encoder, nn_model = load_models()
 except Exception as e:
     st.error(f"Error loading models: {e}")
     st.stop()
-# --- 3. FEATURE EXTRACTION ---
+
+# --- 3. HELPER FUNCTIONS ---
 def calc_entropy(text):
     if not text: return 0
     entropy = 0
@@ -58,151 +64,172 @@ def calc_entropy(text):
     return entropy
 
 def check_brand_usage(row):
-    url_str = str(row['url']).lower()
-    domain_str = str(row['domain']).lower()
-    for brand in BRANDS:
-        if brand in url_str and brand not in domain_str:
-            return 1
-    return 0
+    # This expects 'clean_url' logic inside the row data if possible, 
+    # or we handle it inside extract_features
+    return 0 
 
-# --- UPDATED EXTRACTOR (Matches your Notebook exactly) ---
-def extract_features(url):
-    # Base Dataframe
+def is_whitelisted(url):
     try:
-        domain = tldextract.extract(url).domain
+        obj = tldextract.extract(url)
+        full_domain = f"{obj.domain}.{obj.suffix}"
+        return full_domain in SAFE_DOMAINS or url in SAFE_DOMAINS
     except:
-        domain = ""
-        
-    df = pd.DataFrame({'url': [url], 'domain': [domain]})
-    
-    # 1. Structural Counts
-    df['url_length'] = df['url'].str.len()
-    df['num_digits'] = df['url'].str.count(r'\d')
-    df['num_periods'] = df['url'].str.count(r'\.')
-    df['num_slashes'] = df['url'].str.count(r'/')
-    df['num_ats'] = df['url'].str.count(r'@')
-    
-    # 2. Typosquatting
-    min_dist = 100 
-    for brand in BRANDS:
-        dist = Levenshtein.distance(domain.lower(), brand)
-        if dist < min_dist: min_dist = dist
-            
-    df['min_brand_dist'] = min_dist
-    
-    if min_dist == 0: df['is_typosquat'] = 0
-    elif 0 < min_dist <= 2: df['is_typosquat'] = 1
-    else: df['is_typosquat'] = 0
-    
-    # 3. Ratios & Advanced Stats
-    # Note: Your notebook called it 'digit_len_ratio', so we use that name
-    df['digit_len_ratio'] = df['num_digits'] / (df['url_length'] + 1)
-    
-    df['entropy'] = df['url'].apply(calc_entropy)
-    df['sus_keyword_count'] = df['url'].apply(lambda x: sum(1 for word in SUSPICIOUS_WORDS if word in x.lower()))
-    df['is_suspicious_brand_usage'] = df.apply(check_brand_usage, axis=1)
-    
-    # 4. BOOLEAN FLAGS (The Missing Features!)
-    # These match the regex logic from your notebook
-    df['has_html'] = df['url'].str.contains(r'\.html?', case=False, regex=True).astype(int)
-    df['has_query_param'] = df['url'].str.contains(r'\?query=', case=False, regex=True).astype(int)
-    df['has_https'] = df['url'].str.contains(r'^https://', case=False, regex=True).astype(int)
-    df['has_http'] = df['url'].str.contains(r'^http://', case=False, regex=True).astype(int)
-    df['has_ip_address'] = df['url'].str.contains(r'://(?:\d{1,3}\.){3}\d{1,3}', case=False, regex=True).astype(int)
-    
-    suspicious_kw_str = '|'.join(['login', 'secure', 'payment', 'verify'])
-    df['has_suspicious_kw'] = df['url'].str.contains(suspicious_kw_str, case=False, regex=True).astype(int)
-    
-    # Check for brands in URL
-    brand_pattern = '|'.join(BRANDS)
-    df['has_brand_kw'] = df['url'].str.contains(brand_pattern, case=False, regex=True).astype(int)
-    
-    df['has_non_ascii_chars'] = df['url'].str.contains(r'[^\x00-\x7F]', regex=True).astype(int)
+        return False
 
-    # --- 5. CREATE FEATURE SETS ---
+# --- 4. EXTRACTOR (THE HYBRID LOGIC) ---
+def extract_features(raw_url):
+    # 1. CLEANING (Match Training Logic)
+    clean_url_text = re.sub(r'^https?://', '', raw_url)
+    clean_url_text = re.sub(r'^www\.', '', clean_url_text)
     
-    # FULL LIST: This must match the columns in your X_num_train exactly
-    # I've added the missing ones to this list
-    nn_cols = ['url_length', 'num_digits', 'num_periods', 'num_slashes', 'num_ats', 'digit_len_ratio', 
-               'is_suspicious_brand_usage', 'has_html', 'has_query_param', 'has_https', 'has_http', 
-               'has_ip_address', 'has_suspicious_kw', 'has_brand_kw', 'has_non_ascii_chars', 'entropy']
+    # 2. Extract Domain from CLEAN text
+    try:
+        ext = tldextract.extract(clean_url_text)
+        domain_part = ext.domain
+    except:
+        domain_part = ""
+        
+    # Initialize Dictionary
+    row = {}
     
-    # Reorder columns to match training
-    # We use .reindex to ignore any extra columns and fill missing ones with 0 just in case
+    # --- A. Structural Features (Use CLEAN text) ---
+    row['url_length'] = len(clean_url_text)
+    row['num_digits'] = len(re.findall(r'\d', clean_url_text))
+    row['num_periods'] = clean_url_text.count('.')
+    row['num_slashes'] = clean_url_text.count('/')
+    row['num_ats'] = clean_url_text.count('@')
+    
+    # --- B. Typosquatting ---
+    min_dist = 100
+    clean_domain = domain_part.lower()
+    for brand in BRANDS:
+        dist = Levenshtein.distance(clean_domain, brand)
+        if dist < min_dist:
+            min_dist = dist
+    row['min_brand_dist'] = min_dist
+    
+    if min_dist == 0: row['is_typosquat'] = 0
+    elif 0 < min_dist <= 2: row['is_typosquat'] = 1
+    else: row['is_typosquat'] = 0
+    
+    # --- C. Ratios ---
+    if row['url_length'] > 0:
+        row['digit_len_ratio'] = row['num_digits'] / (row['url_length'] + 1)
+    else:
+        row['digit_len_ratio'] = 0
+        
+    # --- D. Suspicious Brand Usage (Use CLEAN text) ---
+    row['is_suspicious_brand_usage'] = 0
+    url_lower = clean_url_text.lower()
+    domain_lower = domain_part.lower()
+    for brand in BRANDS:
+        if brand in url_lower and brand not in domain_lower:
+            row['is_suspicious_brand_usage'] = 1
+            
+    # --- E. Entropy (Use CLEAN text) ---
+    row['entropy'] = calc_entropy(clean_url_text)
+    
+    # --- F. Boolean Flags (The Logic Split) ---
+    
+    # CRITICAL: Use 'raw_url' for protocol checks (HTTPS/HTTP)
+    # Note: We removed 'has_https'/'has_http' from training because they were broken,
+    # so we DO NOT calculate them here to avoid column mismatch errors.
+    
+    # Use 'raw_url' for IP check and HTML check
+    row['has_html'] = int(bool(re.search(r'\.html?', raw_url, re.IGNORECASE)))
+    row['has_query_param'] = int(bool(re.search(r'\?query=', raw_url, re.IGNORECASE)))
+    row['has_ip_address'] = int(bool(re.search(r'://(?:\d{1,3}\.){3}\d{1,3}', raw_url, re.IGNORECASE)))
+    row['has_non_ascii_chars'] = int(bool(re.search(r'[^\x00-\x7F]', raw_url)))
+    
+    # Use 'clean_url_text' for keyword matching
+    kw_pattern = '(' + '|'.join(SUSPICIOUS_WORDS) + ')'
+    row['has_suspicious_kw'] = int(bool(re.search(kw_pattern, clean_url_text, re.IGNORECASE)))
+    brand_pattern = '|'.join(BRANDS)
+    row['has_brand_kw'] = int(bool(re.search(brand_pattern, clean_url_text, re.IGNORECASE)))
+    
+    # Add keyword count
+    #row['sus_keyword_count'] = sum(1 for word in SUSPICIOUS_WORDS if word in clean_url_text.lower())
+
+    # --- 3. DATAFRAME CREATION ---
+    df = pd.DataFrame([row])
+    
+    # Neural Network Columns (Exact Order from Training)
+    # Note: 'has_https' and 'has_http' are REMOVED based on your last training update
+    nn_cols = [
+        'url_length', 'num_digits', 'num_periods', 'num_slashes', 'num_ats',
+        'min_brand_dist', 'is_typosquat', 'digit_len_ratio', 
+        'is_suspicious_brand_usage', 'entropy', 
+        'has_html', 'has_query_param', 
+        'has_ip_address', 'has_suspicious_kw', 'has_brand_kw', 'has_non_ascii_chars'
+    ]
+    
     X_nn = df.reindex(columns=nn_cols, fill_value=0)
     
-    # Set B: XGBoost Features
-    # If XGBoost was trained on the same data, it uses the same columns (minus typosquat if you dropped it)
-    #xgb_cols = [c for c in nn_cols if c not in ['is_typosquat', 'min_brand_dist']]
-    xgb_cols = ['url_length', 'num_digits', 'num_periods', 'num_slashes', 'num_ats',
-       'min_brand_dist', 'is_typosquat', 'digit_len_ratio',
-       'is_suspicious_brand_usage', 'has_html', 'has_query_param', 'has_https',
-       'has_http', 'has_ip_address', 'has_suspicious_kw', 'has_brand_kw',
-       'has_non_ascii_chars', 'entropy']
-    X_xgb = df.reindex(columns=xgb_cols, fill_value=0)
+    # XGBoost Columns (Assuming you retrained it on the same features)
+    #X_xgb = X_nn.copy()
     
-    return X_nn, X_xgb
+    return X_nn, clean_url_text
 
+# --- 5. PREDICTION LOGIC ---
+def make_prediction(raw_url):
+    # A. Extract Features & Clean Text
+    X_nn_raw, clean_url_text = extract_features(raw_url)
+    
+    # B. XGBoost Prediction
+    #xgb_pred = xgb_model.predict(X_xgb_raw)[0]
+    #xgb_prob = xgb_model.predict_proba(X_xgb_raw)[0][1]
+    
+    # C. Neural Network Prediction
+    # 1. Scale Numerical Data
+    X_num_scaled = scaler.transform(X_nn_raw).astype('float32')
+    
+    # 2. Tokenize Text Data (Use the CLEAN text!)
+    seq = tokenizer.texts_to_sequences([clean_url_text])
+    X_text = pad_sequences(seq, maxlen=200, padding='post', truncating='post')
+    
+    # 3. Predict
+    nn_probs = nn_model.predict([X_text, X_num_scaled])
+    nn_class_idx = np.argmax(nn_probs)
+    nn_label = encoder.inverse_transform([nn_class_idx])[0]
+    nn_conf = np.max(nn_probs)
+    
+    return nn_label, nn_conf
+
+# --- 6. UI LAYOUT ---
 url_input = st.text_input("Enter URL:", placeholder="http://example.com")
 
-# --- 4. UI & LOGIC ---
 if st.button("Scan URL"):
     if not url_input:
         st.warning("Please enter a URL.")
+    
+    # 1. Whitelist Check
+    elif is_whitelisted(url_input):
+        st.success(f"✅ **Result: BENIGN (Verified Safe Domain)**")
+        st.info("This site is on our trusted whitelist (e.g. Google, GitHub). No AI scan needed.")
+        
+    # 2. AI Scan
     else:
         with st.spinner("Analyzing..."):
             try:
-                # Get raw DataFrames
-                X_nn_raw, X_xgb_raw = extract_features(url_input)
+                nn_res, nn_conf = make_prediction(url_input)
                 
-                # --- STAGE 1: XGBoost (The Gatekeeper) ---
-                # Note: XGBoost usually handles raw unscaled data fine, 
-                # but if you trained on SCALED data, you must scale it.
-                # Assuming you trained XGBoost on the SCALED subset:
-                # We need a separate scaler for XGBoost if the columns differ. 
-                # If you don't have one, try running on raw data (often works for trees).
-                xgb_pred = xgb_model.predict(X_xgb_raw)[0]
-                xgb_prob = xgb_model.predict_proba(X_xgb_raw)[0][1]
-                
-                # --- STAGE 2: Neural Network (The Specialist) ---
-                # 1. Scale Numerical Data
-                X_num_scaled = scaler.transform(X_nn_raw).astype('float32')
-                
-                # 2. Tokenize Text Data
-                seq = tokenizer.texts_to_sequences([url_input])
-                X_text = pad_sequences(seq, maxlen=200, padding='post', truncating='post')
-                
-                # 3. Predict
-                nn_probs = nn_model.predict([X_text, X_num_scaled])
-                nn_class_idx = np.argmax(nn_probs)
-                nn_label = encoder.inverse_transform([nn_class_idx])[0]
-                nn_conf = np.max(nn_probs)
-                
-                # --- RESULTS ---
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("XGBoost Model")
-                    if xgb_pred == 1:
-                        st.error("🚨 Flagged Malicious")
-                    else:
-                        st.success("✅ Flagged Safe")
-                    st.metric("Threat Probability", f"{xgb_prob:.2%}")
-                    
-                with col2:
-                    st.subheader("Neural Net Specialist")
-                    st.info(f"Classified as: **{nn_label.upper()}**")
-                    st.metric("Confidence", f"{nn_conf:.2%}")
-                    
+                # --- DYNAMIC STYLING ---
                 st.divider()
-                st.write("### Model Agreement Analysis")
-                if xgb_pred == 0 and nn_label == 'benign':
-                    st.success("Both models agree this URL is Safe.")
-                elif xgb_pred == 1 and nn_label != 'benign':
-                    st.error(f"Critical Alert: Both models detected a threat ({nn_label}). Do not visit.")
+                st.subheader("Analysis Results")
+                
+                if nn_res == 'benign':
+                    # GREEN BOX for Safe
+                    st.success(f"✅ **Result: BENIGN**")
+                    st.metric("Confidence Score", f"{nn_conf:.2%}")
+                    st.caption("This URL appears safe based on our analysis.")
                 else:
-                    st.warning("Models Disagree. Proceed with caution.")
+                    # RED BOX for Threat
+                    st.error(f"🚨 **Result: {nn_res.upper()} DETECTED**")
+                    st.metric("Confidence Score", f"{nn_conf:.2%}")
+                    st.warning("⚠️ Proceed with extreme caution. This site exhibits malicious patterns.")
+                
+                st.divider()
+                st.caption("Disclaimer: AI models can make mistakes. Always verify the source manually.")
                     
             except Exception as e:
                 st.error(f"Prediction Error: {e}")
-                st.write("Debug info - NN Columns expected:", list(X_nn_raw.columns))

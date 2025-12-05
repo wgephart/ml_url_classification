@@ -4,5 +4,4 @@ numpy<2.0
 tensorflow
 xgboost
 scikit-learn
-tldextract
 python-Levenshtein
